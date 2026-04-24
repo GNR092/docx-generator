@@ -20,6 +20,7 @@ UNORDERED_ITEM_RE = re.compile(r"^(\s*)[-*]\s+(.*)$")
 ORDERED_ITEM_RE = re.compile(r"^(\s*)(\d+)\.\s+(.*)$")
 TABLE_SEPARATOR_RE = re.compile(r"^\s*\|?(?:\s*:?-{3,}:?\s*\|)+\s*:?-{3,}:?\s*\|?\s*$")
 QUOTE_RE = re.compile(r"^\s*>\s?(.*)$")
+HR_RE = re.compile(r"^\s*[-*_]{3,}\s*$")
 
 
 RunSpec = tuple[str, bool, bool, bool, str | None]
@@ -475,6 +476,10 @@ def block_paragraphs(lines: list[str], rels: Relationships) -> list[str]:
             index += 1
             continue
 
+        if HR_RE.match(stripped):
+            index += 1
+            continue
+
         if is_markdown_table_start(lines, index):
             table, index = table_xml(lines, index, rels)
             blocks.append(table)
@@ -601,14 +606,22 @@ def generate_docx(
 
 def load_lines(args: argparse.Namespace) -> list[str]:
     lines: list[str] = []
-    if args.title:
-        lines.append(f"# {args.title}")
-        lines.append(f"Fecha: {date.today().isoformat()}")
-        lines.append("")
+    input_has_heading = False
 
     if args.input:
         text = args.input.read_text(encoding="utf-8")
-        lines.extend(text.splitlines())
+        input_lines = text.splitlines()
+        first_content = next((l.strip() for l in input_lines if l.strip()), "")
+        input_has_heading = bool(HEADING_RE.match(first_content))
+        lines.extend(input_lines)
+
+    if args.title and not input_has_heading:
+        if not lines:
+            lines.append(f"# {args.title}")
+        else:
+            lines.insert(0, f"# {args.title}")
+        lines.insert(1, f"Fecha: {date.today().isoformat()}")
+        lines.insert(2, "")
 
     if args.line:
         lines.extend(args.line)
