@@ -18,12 +18,57 @@ from pathlib import Path
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
 UNORDERED_ITEM_RE = re.compile(r"^(\s*)[-*]\s+(.*)$")
 ORDERED_ITEM_RE = re.compile(r"^(\s*)(\d+)\.\s+(.*)$")
+TABLE_SEPARATOR_RE = re.compile(r"^\s*\|?(?:\s*:?-{3,}:?\s*\|)+\s*:?-{3,}:?\s*\|?\s*$")
+QUOTE_RE = re.compile(r"^\s*>\s?(.*)$")
 
 
-RunSpec = tuple[str, bool, bool, bool]
+RunSpec = tuple[str, bool, bool, bool, str | None]
 
 
-def run(text: str, bold: bool = False, italic: bool = False, code: bool = False) -> str:
+class Relationships:
+    def __init__(self) -> None:
+        self._next_id = 3
+        self._link_to_rid: dict[str, str] = {}
+
+    def get_hyperlink_rid(self, url: str) -> str:
+        rid = self._link_to_rid.get(url)
+        if rid is not None:
+            return rid
+        rid = f"rId{self._next_id}"
+        self._next_id += 1
+        self._link_to_rid[url] = rid
+        return rid
+
+    def document_rels_xml(self) -> str:
+        rels = [
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>",
+            "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">",
+            "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" Target=\"styles.xml\"/>",
+            "<Relationship Id=\"rId2\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering\" Target=\"numbering.xml\"/>",
+        ]
+        for url, rid in self._link_to_rid.items():
+            rels.append(
+                "<Relationship "
+                f"Id=\"{rid}\" "
+                "Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink\" "
+                f"Target=\"{xml_escape_attr(url)}\" "
+                "TargetMode=\"External\"/>"
+            )
+        rels.append("</Relationships>")
+        return "".join(rels)
+
+
+def xml_escape_attr(text: str) -> str:
+    return xml_escape(text).replace('"', "&quot;")
+
+
+def run(
+    text: str,
+    bold: bool = False,
+    italic: bool = False,
+    code: bool = False,
+    hyperlink: bool = False,
+) -> str:
     escaped = xml_escape(text)
     props: list[str] = []
     if bold:
@@ -33,6 +78,9 @@ def run(text: str, bold: bool = False, italic: bool = False, code: bool = False)
     if code:
         props.append('<w:rFonts w:ascii="Consolas" w:hAnsi="Consolas" w:cs="Consolas"/>')
         props.append('<w:shd w:val="clear" w:color="auto" w:fill="EDEDED"/>')
+    if hyperlink:
+        props.append('<w:color w:val="0563C1"/>')
+        props.append('<w:u w:val="single"/>')
 
     if props:
         return (
@@ -44,57 +92,103 @@ def run(text: str, bold: bool = False, italic: bool = False, code: bool = False)
     return f'<w:r><w:t xml:space="preserve">{escaped}</w:t></w:r>'
 
 
-def parse_inline_runs(text: str) -> list[RunSpec]:
+def _parse_emphasis(text: str, bold: bool = False, italic: bool = False) -> list[RunSpec]:
     runs: list[RunSpec] = []
-    index = 0
     plain_buffer: list[str] = []
+    index = 0
 
     def flush_plain() -> None:
         if plain_buffer:
-            runs.append(("".join(plain_buffer), False, False, False))
+            runs.append(("".join(plain_buffer), bold, italic, False, None))
             plain_buffer.clear()
 
     while index < len(text):
-        if text.startswith("**", index):
-            end = text.find("**", index + 2)
-            if end != -1 and end > index + 2:
-                flush_plain()
-                runs.append((text[index + 2:end], True, False, False))
-                index = end + 2
-                continue
-            plain_buffer.append("**")
-            index += 2
-            continue
-
-        if text[index] == "*":
-            end = text.find("*", index + 1)
-            if end != -1 and end > index + 1:
-                flush_plain()
-                runs.append((text[index + 1:end], False, True, False))
-                index = end + 1
-                continue
-            plain_buffer.append("*")
+        for marker, add_bold, add_italic in (("***", True, True), ("**", True, False), ("*", False, True)):
+            if text.startswith(marker, index):
+                end = text.find(marker, index + len(marker))
+                if end != -1 and end > index + len(marker):
+                    flush_plain()
+                    inner = text[index + len(marker):end]
+                    runs.extend(_parse_emphasis(inner, bold or add_bold, italic or add_italic))
+                    index = end + len(marker)
+                    break
+                plain_buffer.append(marker)
+                index += len(marker)
+                break
+        else:
+            plain_buffer.append(text[index])
             index += 1
-            continue
-
-        if text[index] == "`":
-            end = text.find("`", index + 1)
-            if end != -1 and end > index + 1:
-                flush_plain()
-                runs.append((text[index + 1:end], False, False, True))
-                index = end + 1
-                continue
-            plain_buffer.append("`")
-            index += 1
-            continue
-
-        plain_buffer.append(text[index])
-        index += 1
 
     flush_plain()
+    return runs
+
+
+def _split_code_spans(text: str) -> list[tuple[str, bool]]:
+    parts: list[tuple[str, bool]] = []
+    index = 0
+    while index < len(text):
+        tick = text.find("`", index)
+        if tick == -1:
+            parts.append((text[index:], False))
+            break
+        if tick > index:
+            parts.append((text[index:tick], False))
+        end = text.find("`", tick + 1)
+        if end == -1:
+            parts.append((text[tick:], False))
+            break
+        parts.append((text[tick + 1:end], True))
+        index = end + 1
+    if not parts:
+        return [("", False)]
+    return parts
+
+
+def _parse_links_and_emphasis(text: str, rels: Relationships) -> list[RunSpec]:
+    runs: list[RunSpec] = []
+    index = 0
+    while index < len(text):
+        start = text.find("[", index)
+        if start == -1:
+            runs.extend(_parse_emphasis(text[index:]))
+            break
+        close_label = text.find("]", start + 1)
+        if close_label == -1 or close_label + 1 >= len(text) or text[close_label + 1] != "(":
+            runs.extend(_parse_emphasis(text[index:]))
+            break
+        close_url = text.find(")", close_label + 2)
+        if close_url == -1:
+            runs.extend(_parse_emphasis(text[index:]))
+            break
+
+        runs.extend(_parse_emphasis(text[index:start]))
+
+        label = text[start + 1:close_label]
+        url = text[close_label + 2:close_url].strip()
+        if url.startswith(("http://", "https://", "mailto:")):
+            rid = rels.get_hyperlink_rid(url)
+            for run_text, run_bold, run_italic, _, _ in _parse_emphasis(label):
+                runs.append((run_text, run_bold, run_italic, False, rid))
+        else:
+            runs.extend(_parse_emphasis(text[start:close_url + 1]))
+
+        index = close_url + 1
 
     if not runs:
-        return [("", False, False, False)]
+        return [("", False, False, False, None)]
+    return runs
+
+
+def parse_inline_runs(text: str, rels: Relationships) -> list[RunSpec]:
+    runs: list[RunSpec] = []
+    for segment, is_code in _split_code_spans(text):
+        if is_code:
+            runs.append((segment, False, False, True, None))
+            continue
+        runs.extend(_parse_links_and_emphasis(segment, rels))
+
+    if not runs:
+        return [("", False, False, False, None)]
     return runs
 
 
@@ -106,54 +200,75 @@ def xml_escape(text: str) -> str:
     )
 
 
-def paragraph(text: str) -> str:
-    runs = "".join(
-        run(content, bold=bold, italic=italic, code=code)
-        for content, bold, italic, code in parse_inline_runs(text)
-    )
+def render_runs(specs: list[RunSpec]) -> str:
+    pieces: list[str] = []
+    current_hyperlink: str | None = None
+    hyperlink_runs: list[str] = []
+
+    def flush_link() -> None:
+        nonlocal current_hyperlink
+        if current_hyperlink is not None:
+            pieces.append(f'<w:hyperlink r:id="{current_hyperlink}" w:history="1">{"".join(hyperlink_runs)}</w:hyperlink>')
+            hyperlink_runs.clear()
+            current_hyperlink = None
+
+    for content, bold, italic, code, hyperlink_rid in specs:
+        run_xml = run(content, bold=bold, italic=italic, code=code, hyperlink=hyperlink_rid is not None)
+        if hyperlink_rid is None:
+            flush_link()
+            pieces.append(run_xml)
+            continue
+        if current_hyperlink is not None and current_hyperlink != hyperlink_rid:
+            flush_link()
+        if current_hyperlink is None:
+            current_hyperlink = hyperlink_rid
+        hyperlink_runs.append(run_xml)
+
+    flush_link()
+    return "".join(pieces)
+
+
+def paragraph(text: str, rels: Relationships) -> str:
+    runs = render_runs(parse_inline_runs(text, rels))
     return f"<w:p>{runs}</w:p>"
 
 
-def paragraph_with_props(text: str, ppr: str) -> str:
-    runs = "".join(
-        run(content, bold=bold, italic=italic, code=code)
-        for content, bold, italic, code in parse_inline_runs(text)
-    )
+def paragraph_with_props(text: str, ppr: str, rels: Relationships) -> str:
+    runs = render_runs(parse_inline_runs(text, rels))
     return f"<w:p><w:pPr>{ppr}</w:pPr>{runs}</w:p>"
 
 
-def heading_paragraph(level: int, text: str) -> str:
-    sizes = {1: 36, 2: 30, 3: 26, 4: 24, 5: 22, 6: 20}
-    size = sizes.get(level, 20)
+def heading_paragraph(level: int, text: str, rels: Relationships) -> str:
+    normalized = min(max(level, 1), 6)
+    ppr = f'<w:pStyle w:val="Heading{normalized}"/><w:spacing w:before="120" w:after="80"/>'
+    return paragraph_with_props(text, ppr, rels)
+
+
+def list_paragraph(text: str, level: int, num_id: int, rels: Relationships) -> str:
+    normalized = min(max(level, 0), 8)
     ppr = (
-        f'<w:pStyle w:val="Heading{level}"/>'
-        '<w:spacing w:before="180" w:after="120"/>'
+        "<w:numPr>"
+        f'<w:ilvl w:val="{normalized}"/>'
+        f'<w:numId w:val="{num_id}"/>'
+        "</w:numPr>"
+        '<w:spacing w:after="40"/>'
     )
-    styled = f"**{text}**"
-    body = paragraph_with_props(styled, ppr)
-    return body.replace("</w:rPr>", f'<w:sz w:val="{size}"/></w:rPr>', 1)
+    return paragraph_with_props(text, ppr, rels)
 
 
-def list_paragraph(text: str, level: int, marker: str) -> str:
-    left = 720 + (max(level, 0) * 360)
+def quote_paragraph(text: str, rels: Relationships) -> str:
     ppr = (
-        f'<w:ind w:left="{left}" w:hanging="360"/>'
-        '<w:spacing w:after="80"/>'
-    )
-    return paragraph_with_props(f"{marker} {text}", ppr)
-
-
-def quote_paragraph(text: str) -> str:
-    ppr = (
+        '<w:pStyle w:val="Quote"/>'
         '<w:ind w:left="720"/>'
         '<w:spacing w:before="60" w:after="60"/>'
         '<w:shd w:val="clear" w:color="auto" w:fill="F7F7F7"/>'
     )
-    return paragraph_with_props(text, ppr)
+    return paragraph_with_props(text, ppr, rels)
 
 
 def code_paragraph(text: str) -> str:
     ppr = (
+        '<w:pStyle w:val="CodeBlock"/>'
         '<w:ind w:left="720"/>'
         '<w:spacing w:before="40" w:after="40"/>'
         '<w:shd w:val="clear" w:color="auto" w:fill="F3F3F3"/>'
@@ -171,52 +286,243 @@ def code_paragraph(text: str) -> str:
     )
 
 
-def block_paragraph(line: str, in_code_block: bool) -> tuple[str, bool]:
-    stripped = line.strip()
-    if stripped.startswith("```"):
-        return "", not in_code_block
-
-    if in_code_block:
-        return code_paragraph(line), in_code_block
-
-    if not stripped:
-        return paragraph(""), in_code_block
-
-    heading_match = HEADING_RE.match(line)
-    if heading_match:
-        level = len(heading_match.group(1))
-        return heading_paragraph(level, heading_match.group(2).strip()), in_code_block
-
-    unordered_match = UNORDERED_ITEM_RE.match(line)
-    if unordered_match:
-        indent = len(unordered_match.group(1).replace("\t", "    "))
-        level = indent // 2
-        return list_paragraph(unordered_match.group(2), level, "-"), in_code_block
-
-    ordered_match = ORDERED_ITEM_RE.match(line)
-    if ordered_match:
-        indent = len(ordered_match.group(1).replace("\t", "    "))
-        level = indent // 2
-        marker = f"{ordered_match.group(2)}."
-        return list_paragraph(ordered_match.group(3), level, marker), in_code_block
-
-    if line.lstrip().startswith("> "):
-        return quote_paragraph(line.lstrip()[2:]), in_code_block
-
-    return paragraph(line), in_code_block
+def split_table_row(row: str) -> list[str]:
+    stripped = row.strip()
+    if stripped.startswith("|"):
+        stripped = stripped[1:]
+    if stripped.endswith("|"):
+        stripped = stripped[:-1]
+    return [cell.strip() for cell in stripped.split("|")]
 
 
-def build_document_xml(lines: list[str]) -> str:
+def table_xml(lines: list[str], start_index: int, rels: Relationships) -> tuple[str, int]:
+    header = split_table_row(lines[start_index])
+    index = start_index + 2
+    body_rows: list[list[str]] = []
+
+    while index < len(lines):
+        candidate = lines[index].strip()
+        if not candidate or "|" not in candidate or TABLE_SEPARATOR_RE.match(candidate):
+            break
+        body_rows.append(split_table_row(lines[index]))
+        index += 1
+
+    columns = max(1, len(header))
+    col_width = max(1200, 9000 // columns)
+
+    tbl_parts = [
+        "<w:tbl>",
+        "<w:tblPr><w:tblStyle w:val=\"TableGrid\"/><w:tblW w:w=\"0\" w:type=\"auto\"/></w:tblPr>",
+        "<w:tblGrid>",
+        "".join(f'<w:gridCol w:w="{col_width}"/>' for _ in range(columns)),
+        "</w:tblGrid>",
+    ]
+
+    def row_xml(cells: list[str], header_row: bool = False) -> str:
+        normalized_cells = cells + [""] * (columns - len(cells))
+        chunks: list[str] = ["<w:tr>"]
+        for cell in normalized_cells[:columns]:
+            text = f"**{cell}**" if header_row else cell
+            chunks.append(
+                "<w:tc>"
+                f'<w:tcPr><w:tcW w:w="{col_width}" w:type="dxa"/></w:tcPr>'
+                f"{paragraph(text, rels)}"
+                "</w:tc>"
+            )
+        chunks.append("</w:tr>")
+        return "".join(chunks)
+
+    tbl_parts.append(row_xml(header, header_row=True))
+    for body in body_rows:
+        tbl_parts.append(row_xml(body))
+
+    tbl_parts.append("</w:tbl>")
+    return "".join(tbl_parts), index
+
+
+def styles_xml() -> str:
+    heading_sizes = {1: 36, 2: 30, 3: 26, 4: 24, 5: 22, 6: 20}
+    heading_styles = "".join(
+        "<w:style w:type=\"paragraph\" "
+        f"w:styleId=\"Heading{level}\">"
+        f"<w:name w:val=\"heading {level}\"/>"
+        "<w:basedOn w:val=\"Normal\"/>"
+        "<w:next w:val=\"Normal\"/>"
+        "<w:uiPriority w:val=\"9\"/>"
+        "<w:qFormat/>"
+        f"<w:pPr><w:spacing w:before=\"{120 + (7 - level) * 20}\" w:after=\"80\"/></w:pPr>"
+        f"<w:rPr><w:b/><w:sz w:val=\"{heading_sizes[level]}\"/></w:rPr>"
+        "</w:style>"
+        for level in range(1, 7)
+    )
+
+    return (
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+        "<w:styles xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">"
+        "<w:docDefaults>"
+        "<w:rPrDefault><w:rPr><w:lang w:val=\"en-US\"/></w:rPr></w:rPrDefault>"
+        "<w:pPrDefault><w:pPr><w:spacing w:line=\"280\" w:lineRule=\"auto\"/></w:pPr></w:pPrDefault>"
+        "</w:docDefaults>"
+        "<w:style w:type=\"paragraph\" w:default=\"1\" w:styleId=\"Normal\">"
+        "<w:name w:val=\"Normal\"/>"
+        "<w:qFormat/>"
+        "</w:style>"
+        f"{heading_styles}"
+        "<w:style w:type=\"paragraph\" w:styleId=\"Quote\">"
+        "<w:name w:val=\"Quote\"/>"
+        "<w:basedOn w:val=\"Normal\"/>"
+        "<w:pPr><w:ind w:left=\"720\"/><w:spacing w:before=\"80\" w:after=\"80\"/></w:pPr>"
+        "<w:rPr><w:i/><w:color w:val=\"555555\"/></w:rPr>"
+        "</w:style>"
+        "<w:style w:type=\"paragraph\" w:styleId=\"CodeBlock\">"
+        "<w:name w:val=\"Code Block\"/>"
+        "<w:basedOn w:val=\"Normal\"/>"
+        "<w:pPr><w:ind w:left=\"720\"/><w:spacing w:before=\"40\" w:after=\"40\"/></w:pPr>"
+        "<w:rPr><w:rFonts w:ascii=\"Consolas\" w:hAnsi=\"Consolas\" w:cs=\"Consolas\"/></w:rPr>"
+        "</w:style>"
+        "</w:styles>"
+    )
+
+
+def numbering_xml() -> str:
+    return (
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+        "<w:numbering xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">"
+        "<w:abstractNum w:abstractNumId=\"0\">"
+        "<w:multiLevelType w:val=\"hybridMultilevel\"/>"
+        "<w:lvl w:ilvl=\"0\"><w:start w:val=\"1\"/><w:numFmt w:val=\"bullet\"/><w:lvlText w:val=\"•\"/><w:lvlJc w:val=\"left\"/><w:pPr><w:ind w:left=\"720\" w:hanging=\"360\"/></w:pPr></w:lvl>"
+        "<w:lvl w:ilvl=\"1\"><w:start w:val=\"1\"/><w:numFmt w:val=\"bullet\"/><w:lvlText w:val=\"◦\"/><w:lvlJc w:val=\"left\"/><w:pPr><w:ind w:left=\"1080\" w:hanging=\"360\"/></w:pPr></w:lvl>"
+        "<w:lvl w:ilvl=\"2\"><w:start w:val=\"1\"/><w:numFmt w:val=\"bullet\"/><w:lvlText w:val=\"▪\"/><w:lvlJc w:val=\"left\"/><w:pPr><w:ind w:left=\"1440\" w:hanging=\"360\"/></w:pPr></w:lvl>"
+        "</w:abstractNum>"
+        "<w:abstractNum w:abstractNumId=\"1\">"
+        "<w:multiLevelType w:val=\"multilevel\"/>"
+        "<w:lvl w:ilvl=\"0\"><w:start w:val=\"1\"/><w:numFmt w:val=\"decimal\"/><w:lvlText w:val=\"%1.\"/><w:lvlJc w:val=\"left\"/><w:pPr><w:ind w:left=\"720\" w:hanging=\"360\"/></w:pPr></w:lvl>"
+        "<w:lvl w:ilvl=\"1\"><w:start w:val=\"1\"/><w:numFmt w:val=\"lowerLetter\"/><w:lvlText w:val=\"%2.\"/><w:lvlJc w:val=\"left\"/><w:pPr><w:ind w:left=\"1080\" w:hanging=\"360\"/></w:pPr></w:lvl>"
+        "<w:lvl w:ilvl=\"2\"><w:start w:val=\"1\"/><w:numFmt w:val=\"lowerRoman\"/><w:lvlText w:val=\"%3.\"/><w:lvlJc w:val=\"left\"/><w:pPr><w:ind w:left=\"1440\" w:hanging=\"360\"/></w:pPr></w:lvl>"
+        "</w:abstractNum>"
+        "<w:num w:numId=\"1\"><w:abstractNumId w:val=\"0\"/></w:num>"
+        "<w:num w:numId=\"2\"><w:abstractNumId w:val=\"1\"/></w:num>"
+        "</w:numbering>"
+    )
+
+
+def app_xml() -> str:
+    return (
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+        "<Properties xmlns=\"http://schemas.openxmlformats.org/officeDocument/2006/extended-properties\" "
+        "xmlns:vt=\"http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes\">"
+        "<Application>docx-generator skill</Application>"
+        "<DocSecurity>0</DocSecurity>"
+        "<ScaleCrop>false</ScaleCrop>"
+        "<HeadingPairs><vt:vector size=\"2\" baseType=\"variant\"><vt:variant><vt:lpstr>Title</vt:lpstr></vt:variant><vt:variant><vt:i4>1</vt:i4></vt:variant></vt:vector></HeadingPairs>"
+        "<TitlesOfParts><vt:vector size=\"1\" baseType=\"lpstr\"><vt:lpstr>Document</vt:lpstr></vt:vector></TitlesOfParts>"
+        "<Company></Company>"
+        "<LinksUpToDate>false</LinksUpToDate>"
+        "<SharedDoc>false</SharedDoc>"
+        "<HyperlinksChanged>false</HyperlinksChanged>"
+        "<AppVersion>16.0000</AppVersion>"
+        "</Properties>"
+    )
+
+
+def core_xml(title: str, author: str, subject: str | None, keywords: str | None) -> str:
+    now = date.today().isoformat() + "T00:00:00Z"
+    subject_xml = f"<dc:subject>{xml_escape(subject)}</dc:subject>" if subject else ""
+    keywords_xml = f"<cp:keywords>{xml_escape(keywords)}</cp:keywords>" if keywords else ""
+    return (
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+        "<cp:coreProperties "
+        "xmlns:cp=\"http://schemas.openxmlformats.org/package/2006/metadata/core-properties\" "
+        "xmlns:dc=\"http://purl.org/dc/elements/1.1/\" "
+        "xmlns:dcterms=\"http://purl.org/dc/terms/\" "
+        "xmlns:dcmitype=\"http://purl.org/dc/dcmitype/\" "
+        "xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\">"
+        f"<dc:title>{xml_escape(title)}</dc:title>"
+        f"<dc:creator>{xml_escape(author)}</dc:creator>"
+        f"<cp:lastModifiedBy>{xml_escape(author)}</cp:lastModifiedBy>"
+        f"{subject_xml}"
+        f"{keywords_xml}"
+        f"<dcterms:created xsi:type=\"dcterms:W3CDTF\">{now}</dcterms:created>"
+        f"<dcterms:modified xsi:type=\"dcterms:W3CDTF\">{now}</dcterms:modified>"
+        "</cp:coreProperties>"
+    )
+
+
+def is_markdown_table_start(lines: list[str], index: int) -> bool:
+    if index + 1 >= len(lines):
+        return False
+    header = lines[index].strip()
+    separator = lines[index + 1].strip()
+    return "|" in header and bool(TABLE_SEPARATOR_RE.match(separator))
+
+
+def block_paragraphs(lines: list[str], rels: Relationships) -> list[str]:
     blocks: list[str] = []
     in_code_block = False
-    for line in lines:
-        block, in_code_block = block_paragraph(line, in_code_block)
-        if block:
-            blocks.append(block)
+    index = 0
+
+    while index < len(lines):
+        line = lines[index]
+        stripped = line.strip()
+
+        if stripped.startswith("```"):
+            in_code_block = not in_code_block
+            index += 1
+            continue
+
+        if in_code_block:
+            blocks.append(code_paragraph(line))
+            index += 1
+            continue
+
+        if is_markdown_table_start(lines, index):
+            table, index = table_xml(lines, index, rels)
+            blocks.append(table)
+            continue
+
+        if not stripped:
+            blocks.append(paragraph("", rels))
+            index += 1
+            continue
+
+        heading_match = HEADING_RE.match(line)
+        if heading_match:
+            level = len(heading_match.group(1))
+            blocks.append(heading_paragraph(level, heading_match.group(2).strip(), rels))
+            index += 1
+            continue
+
+        unordered_match = UNORDERED_ITEM_RE.match(line)
+        if unordered_match:
+            indent = len(unordered_match.group(1).replace("\t", "    "))
+            blocks.append(list_paragraph(unordered_match.group(2), indent // 2, 1, rels))
+            index += 1
+            continue
+
+        ordered_match = ORDERED_ITEM_RE.match(line)
+        if ordered_match:
+            indent = len(ordered_match.group(1).replace("\t", "    "))
+            blocks.append(list_paragraph(ordered_match.group(3), indent // 2, 2, rels))
+            index += 1
+            continue
+
+        quote_match = QUOTE_RE.match(line)
+        if quote_match:
+            blocks.append(quote_paragraph(quote_match.group(1), rels))
+            index += 1
+            continue
+
+        blocks.append(paragraph(line, rels))
+        index += 1
+
     if in_code_block:
         blocks.append(code_paragraph(""))
 
-    body = "".join(blocks)
+    return blocks
+
+
+def build_document_xml(lines: list[str], rels: Relationships) -> str:
+    body = "".join(block_paragraphs(lines, rels))
     return (
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
         "<w:document "
@@ -230,6 +536,7 @@ def build_document_xml(lines: list[str]) -> str:
         "xmlns:wp=\"http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing\" "
         "xmlns:w10=\"urn:schemas-microsoft-com:office:word\" "
         "xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\" "
+        "xmlns:cp=\"http://schemas.openxmlformats.org/package/2006/metadata/core-properties\" "
         "xmlns:w14=\"http://schemas.microsoft.com/office/word/2010/wordml\" "
         "xmlns:wpg=\"http://schemas.microsoft.com/office/word/2010/wordprocessingGroup\" "
         "xmlns:wpi=\"http://schemas.microsoft.com/office/word/2010/wordprocessingInk\" "
@@ -249,28 +556,47 @@ def build_document_xml(lines: list[str]) -> str:
     )
 
 
-def generate_docx(output: Path, lines: list[str]) -> None:
+def generate_docx(
+    output: Path,
+    lines: list[str],
+    title: str,
+    author: str,
+    subject: str | None,
+    keywords: str | None,
+) -> None:
     content_types = (
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
         "<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">"
         "<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>"
         "<Default Extension=\"xml\" ContentType=\"application/xml\"/>"
+        "<Override PartName=\"/docProps/core.xml\" ContentType=\"application/vnd.openxmlformats-package.core-properties+xml\"/>"
+        "<Override PartName=\"/docProps/app.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.extended-properties+xml\"/>"
         "<Override PartName=\"/word/document.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml\"/>"
+        "<Override PartName=\"/word/styles.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml\"/>"
+        "<Override PartName=\"/word/numbering.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml\"/>"
         "</Types>"
     )
     rels = (
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
         "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">"
         "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"word/document.xml\"/>"
+        "<Relationship Id=\"rId2\" Type=\"http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties\" Target=\"docProps/core.xml\"/>"
+        "<Relationship Id=\"rId3\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties\" Target=\"docProps/app.xml\"/>"
         "</Relationships>"
     )
-    document = build_document_xml(lines)
+    relationships = Relationships()
+    document = build_document_xml(lines, relationships)
 
     output.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as docx:
         docx.writestr("[Content_Types].xml", content_types)
         docx.writestr("_rels/.rels", rels)
+        docx.writestr("docProps/core.xml", core_xml(title=title, author=author, subject=subject, keywords=keywords))
+        docx.writestr("docProps/app.xml", app_xml())
         docx.writestr("word/document.xml", document)
+        docx.writestr("word/styles.xml", styles_xml())
+        docx.writestr("word/numbering.xml", numbering_xml())
+        docx.writestr("word/_rels/document.xml.rels", relationships.document_rels_xml())
 
 
 def load_lines(args: argparse.Namespace) -> list[str]:
@@ -298,6 +624,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", required=True, type=Path, help="Output .docx path")
     parser.add_argument("--title", help="Document title")
     parser.add_argument("--input", type=Path, help="Input text/markdown file")
+    parser.add_argument("--author", default="OpenCode", help="Document author metadata")
+    parser.add_argument("--subject", help="Document subject metadata")
+    parser.add_argument("--keywords", help="Comma-separated keywords metadata")
     parser.add_argument(
         "--line",
         action="append",
@@ -309,7 +638,15 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     lines = load_lines(args)
-    generate_docx(args.output, lines)
+    title = args.title or "Documento"
+    generate_docx(
+        args.output,
+        lines,
+        title=title,
+        author=args.author,
+        subject=args.subject,
+        keywords=args.keywords,
+    )
     print(args.output)
 
 

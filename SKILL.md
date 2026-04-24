@@ -17,6 +17,9 @@ python scripts/docx_skill.py --output reporte.docx --title "Reporte tecnico" --i
 - `--output` (requerido): ruta destino del `.docx`
 - `--title`: titulo inicial del documento
 - `--input`: archivo fuente (`.md` o `.txt`)
+- `--author`: autor en metadatos del documento
+- `--subject`: asunto en metadatos del documento
+- `--keywords`: palabras clave (separadas por comas)
 - `--line`: linea inline; se puede repetir varias veces
 
 ## Ejemplos
@@ -29,7 +32,9 @@ python scripts/docx_skill.py --output incidente.docx --title "Incidente" --input
 ## Notas
 
 - Soporta Markdown basico: negrita `**texto**`, cursiva `*texto*`, y codigo inline `` `codigo` ``.
-- Soporta bloques: encabezados `#`, listas (`-`, `*`, `1.`), citas (`>`) y bloques de codigo con triple acento grave.
+- Soporta enlaces Markdown `[texto](https://url)` con hipervinculo real en Word.
+- Soporta bloques: encabezados `#`, listas (`-`, `*`, `1.`) con numeracion Word nativa, citas (`>`) y bloques de codigo con triple acento grave.
+- Soporta tablas Markdown con separador (`|---|---|`) convertidas a tablas DOCX.
 - Convierte `--title` en encabezado principal automaticamente.
-- El documento sigue siendo Word OpenXML minimo, sin dependencias externas.
+- Genera `styles.xml`, `numbering.xml`, y metadatos `docProps` (core/app) sin dependencias externas.
 - Ideal para reportes tecnicos rapidos y evidencia de troubleshooting.
