@@ -341,7 +341,7 @@ def table_xml(lines: list[str], start_index: int, rels: Relationships) -> tuple[
     return "".join(tbl_parts), index
 
 
-def styles_xml() -> str:
+def styles_xml(lang: str = "es-ES") -> str:
     heading_sizes = {1: 36, 2: 30, 3: 26, 4: 24, 5: 22, 6: 20}
     heading_styles = "".join(
         "<w:style w:type=\"paragraph\" "
@@ -361,7 +361,7 @@ def styles_xml() -> str:
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
         "<w:styles xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">"
         "<w:docDefaults>"
-        "<w:rPrDefault><w:rPr><w:lang w:val=\"en-US\"/></w:rPr></w:rPrDefault>"
+        f"<w:rPrDefault><w:rPr><w:lang w:val=\"{lang}\"/></w:rPr></w:rPrDefault>"
         "<w:pPrDefault><w:pPr><w:spacing w:line=\"280\" w:lineRule=\"auto\"/></w:pPr></w:pPrDefault>"
         "</w:docDefaults>"
         "<w:style w:type=\"paragraph\" w:default=\"1\" w:styleId=\"Normal\">"
@@ -426,7 +426,7 @@ def app_xml() -> str:
     )
 
 
-def core_xml(title: str, author: str, subject: str | None, keywords: str | None) -> str:
+def core_xml(title: str, author: str, lang: str, subject: str | None, keywords: str | None) -> str:
     now = date.today().isoformat() + "T00:00:00Z"
     subject_xml = f"<dc:subject>{xml_escape(subject)}</dc:subject>" if subject else ""
     keywords_xml = f"<cp:keywords>{xml_escape(keywords)}</cp:keywords>" if keywords else ""
@@ -439,6 +439,7 @@ def core_xml(title: str, author: str, subject: str | None, keywords: str | None)
         "xmlns:dcmitype=\"http://purl.org/dc/dcmitype/\" "
         "xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\">"
         f"<dc:title>{xml_escape(title)}</dc:title>"
+        f"<dc:language>{xml_escape(lang)}</dc:language>"
         f"<dc:creator>{xml_escape(author)}</dc:creator>"
         f"<cp:lastModifiedBy>{xml_escape(author)}</cp:lastModifiedBy>"
         f"{subject_xml}"
@@ -566,6 +567,7 @@ def generate_docx(
     lines: list[str],
     title: str,
     author: str,
+    lang: str,
     subject: str | None,
     keywords: str | None,
 ) -> None:
@@ -596,10 +598,10 @@ def generate_docx(
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as docx:
         docx.writestr("[Content_Types].xml", content_types)
         docx.writestr("_rels/.rels", rels)
-        docx.writestr("docProps/core.xml", core_xml(title=title, author=author, subject=subject, keywords=keywords))
+        docx.writestr("docProps/core.xml", core_xml(title=title, author=author, lang=lang, subject=subject, keywords=keywords))
         docx.writestr("docProps/app.xml", app_xml())
         docx.writestr("word/document.xml", document)
-        docx.writestr("word/styles.xml", styles_xml())
+        docx.writestr("word/styles.xml", styles_xml(lang))
         docx.writestr("word/numbering.xml", numbering_xml())
         docx.writestr("word/_rels/document.xml.rels", relationships.document_rels_xml())
 
@@ -638,6 +640,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--title", help="Document title")
     parser.add_argument("--input", type=Path, help="Input text/markdown file")
     parser.add_argument("--author", default="OpenCode", help="Document author metadata")
+    parser.add_argument("--lang", default="es-ES", help="Document spell-check language (e.g. es-ES, en-US)")
     parser.add_argument("--subject", help="Document subject metadata")
     parser.add_argument("--keywords", help="Comma-separated keywords metadata")
     parser.add_argument(
@@ -657,6 +660,7 @@ def main() -> None:
         lines,
         title=title,
         author=args.author,
+        lang=args.lang,
         subject=args.subject,
         keywords=args.keywords,
     )
