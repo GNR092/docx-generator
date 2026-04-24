@@ -1,3 +1,8 @@
+---
+name: docx-generator
+description: Genera documentos .docx desde Markdown o texto plano sin dependencias externas.
+---
+
 # Skill: DOCX Generator
 
 Genera documentos `.docx` simples desde texto plano o Markdown usando un script local.
