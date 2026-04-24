@@ -23,6 +23,7 @@ python scripts/docx_skill.py --output reporte.docx --title "Reporte tecnico" --i
 - `--title`: titulo inicial del documento
 - `--input`: archivo fuente (`.md` o `.txt`)
 - `--author`: autor en metadatos del documento
+- `--lang`: idioma de ortografia del documento (por defecto `es-ES`; usa `en-US` para ingles)
 - `--subject`: asunto en metadatos del documento
 - `--keywords`: palabras clave (separadas por comas)
 - `--line`: linea inline; se puede repetir varias veces
