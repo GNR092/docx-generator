@@ -23,10 +23,6 @@ ORDERED_ITEM_RE = re.compile(r"^(\s*)(\d+)\.\s+(.*)$")
 RunSpec = tuple[str, bool, bool, bool]
 
 
-def xml_escape_attr(text: str) -> str:
-    return xml_escape(text).replace('"', "&quot;")
-
-
 def run(text: str, bold: bool = False, italic: bool = False, code: bool = False) -> str:
     escaped = xml_escape(text)
     props: list[str] = []

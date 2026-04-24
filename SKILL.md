@@ -28,6 +28,8 @@ python scripts/docx_skill.py --output incidente.docx --title "Incidente" --input
 
 ## Notas
 
-- Soporta negritas inline usando Markdown basico: `**texto**`.
-- El documento es formato Word OpenXML minimo (sin estilos avanzados).
+- Soporta Markdown basico: negrita `**texto**`, cursiva `*texto*`, y codigo inline `` `codigo` ``.
+- Soporta bloques: encabezados `#`, listas (`-`, `*`, `1.`), citas (`>`) y bloques de codigo con triple acento grave.
+- Convierte `--title` en encabezado principal automaticamente.
+- El documento sigue siendo Word OpenXML minimo, sin dependencias externas.
 - Ideal para reportes tecnicos rapidos y evidencia de troubleshooting.
