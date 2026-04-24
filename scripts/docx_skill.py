@@ -13,6 +13,7 @@ import re
 import zipfile
 from datetime import date
 from pathlib import Path
+from typing import Optional, Tuple
 
 
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
@@ -23,7 +24,7 @@ QUOTE_RE = re.compile(r"^\s*>\s?(.*)$")
 HR_RE = re.compile(r"^\s*[-*_]{3,}\s*$")
 
 
-RunSpec = tuple[str, bool, bool, bool, str | None]
+RunSpec = Tuple[str, bool, bool, bool, Optional[str]]
 
 
 class Relationships:

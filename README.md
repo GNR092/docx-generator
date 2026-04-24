@@ -11,7 +11,7 @@ Generador de archivos `.docx` desde texto plano o Markdown, sin dependencias ext
 
 ## Requisitos
 
-- Python 3.10+ (recomendado).
+- Python 3.9+ (recomendado 3.10+).
 - No requiere librerias externas (usa solo libreria estandar).
 
 ## Script principal
