@@ -1,67 +1,47 @@
 #!/usr/bin/env python3
-"""Generate simple .docx files from plain text or markdown-like input.
+"""Generate .docx or .pdf files from plain text or markdown-like input.
 
 Examples:
   python scripts/docx_skill.py --output reporte.docx --title "Reporte" --input reporte.md
-  python scripts/docx_skill.py --output nota.docx --title "Nota" --line "Linea 1" --line "Linea 2"
+  python scripts/docx_skill.py --output reporte.pdf --format pdf --title "Reporte" --input reporte.md
 """
 
 from __future__ import annotations
 
 import argparse
 import re
+import shutil
+import sys
 import zipfile
 from datetime import date
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional
+
+from parsers import (
+    parse_blocks, parse_inline_runs, split_table_row, Block, BlockSpec, RunSpec,
+    Relationships, xml_escape
+)
+
+
+def check_python() -> bool:
+    if not shutil.which("python") and not shutil.which("python3"):
+        print("ERROR: Python no esta instalado. Por favor instala Python 3.9+ para usar esta funcion.")
+        return False
+    return True
+
+
+def check_reportlab() -> bool:
+    try:
+        import reportlab
+        return True
+    except ImportError:
+        return False
 
 
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
-UNORDERED_ITEM_RE = re.compile(r"^(\s*)[-*]\s+(.*)$")
-ORDERED_ITEM_RE = re.compile(r"^(\s*)(\d+)\.\s+(.*)$")
-TABLE_SEPARATOR_RE = re.compile(r"^\s*\|?(?:\s*:?-{3,}:?\s*\|)+\s*:?-{3,}:?\s*\|?\s*$")
-QUOTE_RE = re.compile(r"^\s*>\s?(.*)$")
-HR_RE = re.compile(r"^\s*[-*_]{3,}\s*$")
 
 
-RunSpec = Tuple[str, bool, bool, bool, Optional[str]]
-
-
-class Relationships:
-    def __init__(self) -> None:
-        self._next_id = 3
-        self._link_to_rid: dict[str, str] = {}
-
-    def get_hyperlink_rid(self, url: str) -> str:
-        rid = self._link_to_rid.get(url)
-        if rid is not None:
-            return rid
-        rid = f"rId{self._next_id}"
-        self._next_id += 1
-        self._link_to_rid[url] = rid
-        return rid
-
-    def document_rels_xml(self) -> str:
-        rels = [
-            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>",
-            "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">",
-            "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" Target=\"styles.xml\"/>",
-            "<Relationship Id=\"rId2\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering\" Target=\"numbering.xml\"/>",
-        ]
-        for url, rid in self._link_to_rid.items():
-            rels.append(
-                "<Relationship "
-                f"Id=\"{rid}\" "
-                "Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink\" "
-                f"Target=\"{xml_escape_attr(url)}\" "
-                "TargetMode=\"External\"/>"
-            )
-        rels.append("</Relationships>")
-        return "".join(rels)
-
-
-def xml_escape_attr(text: str) -> str:
-    return xml_escape(text).replace('"', "&quot;")
+RunSpec = tuple[str, bool, bool, bool, Optional[str]]
 
 
 def run(
@@ -94,115 +74,7 @@ def run(
     return f'<w:r><w:t xml:space="preserve">{escaped}</w:t></w:r>'
 
 
-def _parse_emphasis(text: str, bold: bool = False, italic: bool = False) -> list[RunSpec]:
-    runs: list[RunSpec] = []
-    plain_buffer: list[str] = []
-    index = 0
-
-    def flush_plain() -> None:
-        if plain_buffer:
-            runs.append(("".join(plain_buffer), bold, italic, False, None))
-            plain_buffer.clear()
-
-    while index < len(text):
-        for marker, add_bold, add_italic in (("***", True, True), ("**", True, False), ("*", False, True)):
-            if text.startswith(marker, index):
-                end = text.find(marker, index + len(marker))
-                if end != -1 and end > index + len(marker):
-                    flush_plain()
-                    inner = text[index + len(marker):end]
-                    runs.extend(_parse_emphasis(inner, bold or add_bold, italic or add_italic))
-                    index = end + len(marker)
-                    break
-                plain_buffer.append(marker)
-                index += len(marker)
-                break
-        else:
-            plain_buffer.append(text[index])
-            index += 1
-
-    flush_plain()
-    return runs
-
-
-def _split_code_spans(text: str) -> list[tuple[str, bool]]:
-    parts: list[tuple[str, bool]] = []
-    index = 0
-    while index < len(text):
-        tick = text.find("`", index)
-        if tick == -1:
-            parts.append((text[index:], False))
-            break
-        if tick > index:
-            parts.append((text[index:tick], False))
-        end = text.find("`", tick + 1)
-        if end == -1:
-            parts.append((text[tick:], False))
-            break
-        parts.append((text[tick + 1:end], True))
-        index = end + 1
-    if not parts:
-        return [("", False)]
-    return parts
-
-
-def _parse_links_and_emphasis(text: str, rels: Relationships) -> list[RunSpec]:
-    runs: list[RunSpec] = []
-    index = 0
-    while index < len(text):
-        start = text.find("[", index)
-        if start == -1:
-            runs.extend(_parse_emphasis(text[index:]))
-            break
-        close_label = text.find("]", start + 1)
-        if close_label == -1 or close_label + 1 >= len(text) or text[close_label + 1] != "(":
-            runs.extend(_parse_emphasis(text[index:]))
-            break
-        close_url = text.find(")", close_label + 2)
-        if close_url == -1:
-            runs.extend(_parse_emphasis(text[index:]))
-            break
-
-        runs.extend(_parse_emphasis(text[index:start]))
-
-        label = text[start + 1:close_label]
-        url = text[close_label + 2:close_url].strip()
-        if url.startswith(("http://", "https://", "mailto:")):
-            rid = rels.get_hyperlink_rid(url)
-            for run_text, run_bold, run_italic, _, _ in _parse_emphasis(label):
-                runs.append((run_text, run_bold, run_italic, False, rid))
-        else:
-            runs.extend(_parse_emphasis(text[start:close_url + 1]))
-
-        index = close_url + 1
-
-    if not runs:
-        return [("", False, False, False, None)]
-    return runs
-
-
-def parse_inline_runs(text: str, rels: Relationships) -> list[RunSpec]:
-    runs: list[RunSpec] = []
-    for segment, is_code in _split_code_spans(text):
-        if is_code:
-            runs.append((segment, False, False, True, None))
-            continue
-        runs.extend(_parse_links_and_emphasis(segment, rels))
-
-    if not runs:
-        return [("", False, False, False, None)]
-    return runs
-
-
-def xml_escape(text: str) -> str:
-    return (
-        text.replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-    )
-
-
-def render_runs(specs: list[RunSpec]) -> str:
+def render_runs(specs: list) -> str:
     pieces: list[str] = []
     current_hyperlink: str | None = None
     hyperlink_runs: list[str] = []
@@ -214,7 +86,12 @@ def render_runs(specs: list[RunSpec]) -> str:
             hyperlink_runs.clear()
             current_hyperlink = None
 
-    for content, bold, italic, code, hyperlink_rid in specs:
+    for spec in specs:
+        if len(spec) == 5:
+            content, bold, italic, code, hyperlink_rid = spec
+        else:
+            content, bold, italic, code = spec
+            hyperlink_rid = None
         run_xml = run(content, bold=bold, italic=italic, code=code, hyperlink=hyperlink_rid is not None)
         if hyperlink_rid is None:
             flush_link()
@@ -231,12 +108,12 @@ def render_runs(specs: list[RunSpec]) -> str:
 
 
 def paragraph(text: str, rels: Relationships) -> str:
-    runs = render_runs(parse_inline_runs(text, rels))
+    runs = render_runs(parse_inline_runs(text))
     return f"<w:p>{runs}</w:p>"
 
 
 def paragraph_with_props(text: str, ppr: str, rels: Relationships) -> str:
-    runs = render_runs(parse_inline_runs(text, rels))
+    runs = render_runs(parse_inline_runs(text))
     return f"<w:p><w:pPr>{ppr}</w:pPr>{runs}</w:p>"
 
 
@@ -288,15 +165,6 @@ def code_paragraph(text: str) -> str:
     )
 
 
-def split_table_row(row: str) -> list[str]:
-    stripped = row.strip()
-    if stripped.startswith("|"):
-        stripped = stripped[1:]
-    if stripped.endswith("|"):
-        stripped = stripped[:-1]
-    return [cell.strip() for cell in stripped.split("|")]
-
-
 def table_xml(lines: list[str], start_index: int, rels: Relationships) -> tuple[str, int]:
     header = split_table_row(lines[start_index])
     index = start_index + 2
@@ -304,7 +172,10 @@ def table_xml(lines: list[str], start_index: int, rels: Relationships) -> tuple[
 
     while index < len(lines):
         candidate = lines[index].strip()
-        if not candidate or "|" not in candidate or TABLE_SEPARATOR_RE.match(candidate):
+        if not candidate or "|" not in candidate:
+            break
+        from parsers import TABLE_SEPARATOR_RE
+        if TABLE_SEPARATOR_RE.match(candidate):
             break
         body_rows.append(split_table_row(lines[index]))
         index += 1
@@ -324,11 +195,11 @@ def table_xml(lines: list[str], start_index: int, rels: Relationships) -> tuple[
         normalized_cells = cells + [""] * (columns - len(cells))
         chunks: list[str] = ["<w:tr>"]
         for cell in normalized_cells[:columns]:
-            text = f"**{cell}**" if header_row else cell
+            cell_text = f"**{cell}**" if header_row else cell
             chunks.append(
                 "<w:tc>"
                 f'<w:tcPr><w:tcW w:w="{col_width}" w:type="dxa"/></w:tcPr>'
-                f"{paragraph(text, rels)}"
+                f"{paragraph(cell_text, rels)}"
                 "</w:tc>"
             )
         chunks.append("</w:tr>")
@@ -451,85 +322,44 @@ def core_xml(title: str, author: str, lang: str, subject: str | None, keywords: 
     )
 
 
-def is_markdown_table_start(lines: list[str], index: int) -> bool:
-    if index + 1 >= len(lines):
-        return False
-    header = lines[index].strip()
-    separator = lines[index + 1].strip()
-    return "|" in header and bool(TABLE_SEPARATOR_RE.match(separator))
-
-
-def block_paragraphs(lines: list[str], rels: Relationships) -> list[str]:
-    blocks: list[str] = []
-    in_code_block = False
-    index = 0
-
-    while index < len(lines):
-        line = lines[index]
-        stripped = line.strip()
-
-        if stripped.startswith("```"):
-            in_code_block = not in_code_block
-            index += 1
-            continue
-
-        if in_code_block:
-            blocks.append(code_paragraph(line))
-            index += 1
-            continue
-
-        if HR_RE.match(stripped):
-            index += 1
-            continue
-
-        if is_markdown_table_start(lines, index):
-            table, index = table_xml(lines, index, rels)
-            blocks.append(table)
-            continue
-
-        if not stripped:
-            blocks.append(paragraph("", rels))
-            index += 1
-            continue
-
-        heading_match = HEADING_RE.match(line)
-        if heading_match:
-            level = len(heading_match.group(1))
-            blocks.append(heading_paragraph(level, heading_match.group(2).strip(), rels))
-            index += 1
-            continue
-
-        unordered_match = UNORDERED_ITEM_RE.match(line)
-        if unordered_match:
-            indent = len(unordered_match.group(1).replace("\t", "    "))
-            blocks.append(list_paragraph(unordered_match.group(2), indent // 2, 1, rels))
-            index += 1
-            continue
-
-        ordered_match = ORDERED_ITEM_RE.match(line)
-        if ordered_match:
-            indent = len(ordered_match.group(1).replace("\t", "    "))
-            blocks.append(list_paragraph(ordered_match.group(3), indent // 2, 2, rels))
-            index += 1
-            continue
-
-        quote_match = QUOTE_RE.match(line)
-        if quote_match:
-            blocks.append(quote_paragraph(quote_match.group(1), rels))
-            index += 1
-            continue
-
-        blocks.append(paragraph(line, rels))
-        index += 1
-
-    if in_code_block:
-        blocks.append(code_paragraph(""))
-
-    return blocks
-
-
 def build_document_xml(lines: list[str], rels: Relationships) -> str:
-    body = "".join(block_paragraphs(lines, rels))
+    blocks = parse_blocks(lines, rels)
+    body_parts: list[str] = []
+
+    for block_type, text, level, items, body_rows in blocks:
+        if block_type == Block.PARAGRAPH:
+            if text:
+                body_parts.append(paragraph(text, rels))
+            else:
+                body_parts.append(paragraph("", rels))
+
+        elif block_type == Block.HEADING:
+            body_parts.append(heading_paragraph(level, text, rels))
+
+        elif block_type == Block.UNORDERED_LIST:
+            for item in items:
+                body_parts.append(list_paragraph(item, level, 1, rels))
+
+        elif block_type == Block.ORDERED_LIST:
+            for item in items:
+                body_parts.append(list_paragraph(item, level, 2, rels))
+
+        elif block_type == Block.QUOTE:
+            body_parts.append(quote_paragraph(text, rels))
+
+        elif block_type == Block.CODE_BLOCK:
+            for line in items:
+                body_parts.append(code_paragraph(line))
+
+        elif block_type == Block.TABLE:
+            if body_rows is not None:
+                tbl, _ = table_xml(lines, lines.index(f"|{'|'.join(header := items)}|"), rels)
+                body_parts.append(tbl)
+
+        elif block_type == Block.HR:
+            pass
+
+    body = "".join(body_parts)
     return (
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
         "<w:document "
@@ -636,8 +466,9 @@ def load_lines(args: argparse.Namespace) -> list[str]:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="DOCX generator skill script")
-    parser.add_argument("--output", required=True, type=Path, help="Output .docx path")
+    parser = argparse.ArgumentParser(description="DOCX/PDF generator skill script")
+    parser.add_argument("--output", required=True, type=Path, help="Output path (.docx or .pdf)")
+    parser.add_argument("--format", choices=["docx", "pdf"], help="Output format (default: inferred from --output extension)")
     parser.add_argument("--title", help="Document title")
     parser.add_argument("--input", type=Path, help="Input text/markdown file")
     parser.add_argument("--author", default="OpenCode", help="Document author metadata")
@@ -652,20 +483,229 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main() -> None:
-    args = parse_args()
-    lines = load_lines(args)
-    title = args.title or "Documento"
-    generate_docx(
-        args.output,
-        lines,
-        title=title,
+def detect_format(output: Path, format_arg: str | None) -> str:
+    if format_arg in ("docx", "pdf"):
+        return format_arg
+    ext = output.suffix.lower()
+    if ext == ".pdf":
+        return "pdf"
+    return "docx"
+
+
+def run_pdf(args: argparse.Namespace, lines: list[str]) -> None:
+    if not check_reportlab():
+        print("ERROR: La libreria 'reportlab' no esta instalada.")
+        print("Por favor ejecuta: pip install reportlab")
+        sys.exit(1)
+
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.lib.units import cm
+    from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_JUSTIFY
+    from reportlab.platypus import (
+        SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle,
+        ListFlowable, ListItem, HRFlowable
+    )
+    from parsers import Block
+
+    def build_paragraph_style(name: str, **kwargs) -> ParagraphStyle:
+        defaults = {
+            "fontName": "Helvetica",
+            "fontSize": 11,
+            "leading": 15,
+            "textColor": colors.black,
+            "alignment": TA_LEFT,
+            "spaceAfter": 8,
+        }
+        defaults.update(kwargs)
+        return ParagraphStyle(name=name, **defaults)
+
+    def runs_to_markup(specs: list) -> str:
+        parts: list[str] = []
+        for text, bold, italic, code in specs:
+            if code:
+                text = f"<font face='Courier'>{text}</font>"
+            elif bold and italic:
+                text = f"<b><i>{text}</i></b>"
+            elif bold:
+                text = f"<b>{text}</b>"
+            elif italic:
+                text = f"<i>{text}</i>"
+            parts.append(text)
+        return "".join(parts)
+
+    def make_paragraph(text: str, style: ParagraphStyle) -> Paragraph:
+        from parsers import parse_inline_runs as pr
+        specs = pr(text)
+        markup = runs_to_markup(specs)
+        return Paragraph(markup, style)
+
+    def make_heading_paragraph(text: str, level: int) -> Paragraph:
+        size_map = {1: 24, 2: 20, 3: 17, 4: 15, 5: 13, 6: 12}
+        size = size_map.get(level, 14)
+        style = build_paragraph_style(
+            f"Heading{level}",
+            fontName="Helvetica-Bold",
+            fontSize=size,
+            leading=size + 4,
+            textColor=colors.HexColor("#1a1a1a"),
+            spaceBefore=20 if level <= 2 else 14,
+            spaceAfter=10,
+            alignment=TA_LEFT,
+        )
+        return Paragraph(text, style)
+
+    def make_quote_paragraph(text: str) -> Paragraph:
+        style = build_paragraph_style(
+            "Quote",
+            fontName="Helvetica-Oblique",
+            fontSize=10,
+            leading=14,
+            textColor=colors.HexColor("#555555"),
+            leftIndent=20,
+            rightIndent=20,
+            spaceBefore=8,
+            spaceAfter=8,
+            alignment=TA_LEFT,
+        )
+        from parsers import parse_inline_runs as pr
+        markup = runs_to_markup(pr(text))
+        return Paragraph(markup, style)
+
+    def make_code_block(lines: list[str]) -> list[Paragraph]:
+        style = build_paragraph_style(
+            "CodeBlock",
+            fontName="Courier",
+            fontSize=9,
+            leading=12,
+            textColor=colors.HexColor("#333333"),
+            leftIndent=20,
+            rightIndent=20,
+            spaceBefore=6,
+            spaceAfter=6,
+        )
+        return [Paragraph("\n".join(lines), style)]
+
+    def make_table(header: list[str], body_rows: list[list[str]]) -> Table:
+        data = [header] + body_rows
+        col_count = max(len(h) for h in [header] + body_rows) if body_rows else len(header)
+        col_width = (15 * cm) / col_count if col_count > 0 else 3 * cm
+        tbl = Table(data, colWidths=[col_width] * col_count)
+        tbl.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#34495e")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, 0), 10),
+            ("BOTTOMPADDING", (0, 0), (-1, 0), 10),
+            ("TOPPADDING", (0, 0), (-1, 0), 10),
+            ("BACKGROUND", (0, 1), (-1, -1), colors.HexColor("#ecf0f1")),
+            ("FONTNAME", (0, 1), (-1, -1), "Helvetica"),
+            ("FONTSIZE", (0, 1), (-1, -1), 9),
+            ("TOPPADDING", (0, 1), (-1, -1), 8),
+            ("BOTTOMPADDING", (0, 1), (-1, -1), 8),
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#bdc3c7")),
+            ("ALIGN", (0, 0), (-1, -1), "LEFT"),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 8),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+        ]))
+        return tbl
+
+    def make_unordered_list(items: list[str], style: ParagraphStyle) -> ListFlowable:
+        list_items = [ListItem(make_paragraph(text, style)) for text in items]
+        return ListFlowable(list_items, bulletType="bullet")
+
+    def make_ordered_list(items: list[str], style: ParagraphStyle) -> ListFlowable:
+        list_items = [ListItem(make_paragraph(text, style)) for text in items]
+        return ListFlowable(list_items, bulletType="decimal")
+
+    from parsers import Relationships as Rels, parse_blocks as pb
+    rels = Rels()
+    blocks = pb(lines, rels)
+    story: list = []
+
+    normal_style = build_paragraph_style(
+        "Normal",
+        fontName="Helvetica",
+        fontSize=11,
+        leading=15,
+        textColor=colors.black,
+        alignment=TA_JUSTIFY,
+        spaceAfter=8,
+    )
+
+    for block_type, text, level, items, body_rows in blocks:
+        if block_type == Block.PARAGRAPH:
+            if text:
+                story.append(make_paragraph(text, normal_style))
+            else:
+                story.append(Spacer(1, 8))
+
+        elif block_type == Block.HEADING:
+            story.append(make_heading_paragraph(text, level))
+
+        elif block_type == Block.QUOTE:
+            story.append(make_quote_paragraph(text))
+
+        elif block_type == Block.CODE_BLOCK:
+            story.extend(make_code_block(items))
+
+        elif block_type == Block.TABLE:
+            if body_rows is not None:
+                story.append(make_table(items, body_rows))
+                story.append(Spacer(1, 12))
+
+        elif block_type == Block.UNORDERED_LIST:
+            story.append(make_unordered_list(items, normal_style))
+            story.append(Spacer(1, 8))
+
+        elif block_type == Block.ORDERED_LIST:
+            story.append(make_ordered_list(items, normal_style))
+            story.append(Spacer(1, 8))
+
+        elif block_type == Block.HR:
+            story.append(HRFlowable(width="100%", thickness=0.5, color=colors.gray))
+            story.append(Spacer(1, 8))
+
+    doc = SimpleDocTemplate(
+        str(args.output),
+        pagesize=A4,
+        rightMargin=2 * cm,
+        leftMargin=2 * cm,
+        topMargin=2.5 * cm,
+        bottomMargin=2.5 * cm,
+        title=args.title or "Document",
         author=args.author,
-        lang=args.lang,
         subject=args.subject,
         keywords=args.keywords,
     )
+
+    doc.build(story)
     print(args.output)
+
+
+def main() -> None:
+    args = parse_args()
+    fmt = detect_format(args.output, args.format)
+
+    if fmt == "pdf":
+        if not check_python() or not check_reportlab():
+            sys.exit(1)
+        lines = load_lines(args)
+        run_pdf(args, lines)
+    else:
+        lines = load_lines(args)
+        generate_docx(
+            args.output,
+            lines,
+            title=args.title or "Documento",
+            author=args.author,
+            lang=args.lang,
+            subject=args.subject,
+            keywords=args.keywords,
+        )
+        print(args.output)
 
 
 if __name__ == "__main__":
